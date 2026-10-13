@@ -29,6 +29,10 @@ use crate::protocol::v2::WebSearchItem;
 use crate::protocol::v2::web_search_action_from_core;
 use codex_extension_items::image_generation::ImageGenerationItem;
 use codex_protocol::items::parse_hook_prompt_message;
+use codex_protocol::models::ContentItem as CoreContentItem;
+use codex_protocol::models::ImageReference as CoreImageReference;
+use codex_protocol::models::ResponseItem as CoreResponseItem;
+use codex_protocol::models::is_local_image_open_tag_text;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::AgentReasoningEvent;
 use codex_protocol::protocol::AgentReasoningRawContentEvent;
@@ -64,6 +68,8 @@ use codex_protocol::review_format::REVIEW_FALLBACK_MESSAGE;
 use codex_rollout::CompactedItem;
 use codex_rollout::RolloutItem;
 use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::path::PathBuf;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -251,6 +257,7 @@ pub struct ThreadHistoryBuilder {
     current_rollout_index: usize,
     next_rollout_index: usize,
     active_change_set: Option<ThreadHistoryChangeSet>,
+    pending_local_image_fallbacks: HashMap<PathBuf, VecDeque<String>>,
 }
 
 impl Default for ThreadHistoryBuilder {
@@ -268,6 +275,7 @@ impl ThreadHistoryBuilder {
             current_rollout_index: 0,
             next_rollout_index: 0,
             active_change_set: None,
+            pending_local_image_fallbacks: HashMap::new(),
         }
     }
 
@@ -476,7 +484,8 @@ impl ThreadHistoryBuilder {
     }
 
     fn handle_response_item(&mut self, item: &codex_protocol::models::ResponseItem) {
-        let codex_protocol::models::ResponseItem::Message {
+        self.pending_local_image_fallbacks.clear();
+        let CoreResponseItem::Message {
             role, content, id, ..
         } = item
         else {
@@ -486,6 +495,8 @@ impl ThreadHistoryBuilder {
         if role != "user" {
             return;
         }
+
+        self.pending_local_image_fallbacks = local_image_fallbacks_from_response_item(content);
 
         let Some(hook_prompt) = parse_hook_prompt_message(id.as_deref(), content) else {
             return;
@@ -512,7 +523,8 @@ impl ThreadHistoryBuilder {
             self.finish_current_turn();
         }
         let id = self.next_item_id();
-        let content = self.build_user_inputs(payload);
+        let mut local_image_fallbacks = std::mem::take(&mut self.pending_local_image_fallbacks);
+        let content = self.build_user_inputs(payload, &mut local_image_fallbacks);
         self.push_item_in_current_turn(ThreadItem::UserMessage {
             id,
             client_id: payload.client_id.clone(),
@@ -1540,7 +1552,11 @@ impl ThreadHistoryBuilder {
         id
     }
 
-    fn build_user_inputs(&self, payload: &UserMessageEvent) -> Vec<UserInput> {
+    fn build_user_inputs(
+        &self,
+        payload: &UserMessageEvent,
+        local_image_fallbacks: &mut HashMap<PathBuf, VecDeque<String>>,
+    ) -> Vec<UserInput> {
         let mut content = Vec::new();
         if !payload.message.trim().is_empty() {
             content.push(UserInput::Text {
@@ -1610,10 +1626,21 @@ impl ThreadHistoryBuilder {
             }
         }
         for (idx, path) in payload.local_images.iter().enumerate() {
-            content.push(UserInput::LocalImage {
-                path: path.clone(),
-                detail: payload.local_image_details.get(idx).copied().flatten(),
-            });
+            let detail = payload.local_image_details.get(idx).copied().flatten();
+            if let Some(image_url) = local_image_fallbacks
+                .get_mut(path)
+                .and_then(VecDeque::pop_front)
+            {
+                content.push(UserInput::Image {
+                    image: ImageReference::Inline { url: image_url },
+                    detail,
+                });
+            } else {
+                content.push(UserInput::LocalImage {
+                    path: path.clone(),
+                    detail,
+                });
+            }
         }
         if let Some(audio) = &payload.audio {
             content.extend(audio.iter().cloned().map(|url| UserInput::Audio { url }));
@@ -1627,6 +1654,46 @@ impl ThreadHistoryBuilder {
         );
         content
     }
+}
+
+fn local_image_fallbacks_from_response_item(
+    content: &[CoreContentItem],
+) -> HashMap<PathBuf, VecDeque<String>> {
+    let mut fallbacks = HashMap::new();
+    let mut current_local_image_path = None;
+
+    for item in content {
+        match item {
+            CoreContentItem::InputText { text } => {
+                current_local_image_path = local_image_path_from_open_tag(text);
+            }
+            CoreContentItem::InputImage {
+                image: CoreImageReference::Inline { image_url },
+                ..
+            } => {
+                if let Some(path) = current_local_image_path.take()
+                    && image_url.starts_with("data:image/")
+                {
+                    fallbacks
+                        .entry(path)
+                        .or_insert_with(VecDeque::new)
+                        .push_back(image_url.clone());
+                }
+            }
+            _ => current_local_image_path = None,
+        }
+    }
+
+    fallbacks
+}
+
+fn local_image_path_from_open_tag(text: &str) -> Option<PathBuf> {
+    if !is_local_image_open_tag_text(text) {
+        return None;
+    }
+
+    let path = text.rsplit_once(" path=\"")?.1.strip_suffix("\">")?;
+    Some(PathBuf::from(path))
 }
 
 fn convert_dynamic_tool_content_items(
@@ -2147,6 +2214,134 @@ mod tests {
                     },
                 ],
             }
+        );
+    }
+
+    #[test]
+    fn restores_local_image_history_from_embedded_response_item_data() {
+        let local_image_path = PathBuf::from("/tmp/codex-clipboard-local.png");
+        let second_local_image_path = PathBuf::from("/tmp/codex-clipboard-local-2.png");
+        let unpaired_local_image_path = PathBuf::from("/tmp/codex-clipboard-next.png");
+        let remote_image_url = "https://example.com/remote.png";
+        let remote_image_data = "data:image/png;base64,cmVtb3Rl";
+        let local_image_data = "data:image/png;base64,bG9jYWw=";
+        let second_local_image_data = "data:image/png;base64,bG9jYWwtMg==";
+        let local_response_item = codex_protocol::models::ResponseItem::Message {
+            status: None,
+            encrypted_content: None,
+            id: None,
+            role: "user".into(),
+            content: vec![
+                codex_protocol::models::ContentItem::InputText {
+                    text: "inspect these".into(),
+                },
+                codex_protocol::models::ContentItem::InputImage {
+                    image: codex_protocol::models::ImageReference::Inline {
+                        image_url: remote_image_data.into(),
+                    },
+                    detail: Some(ImageDetail::Low),
+                },
+                codex_protocol::models::ContentItem::InputText {
+                    text: codex_protocol::models::local_image_open_tag_text_with_path(
+                        2,
+                        &local_image_path,
+                    ),
+                },
+                codex_protocol::models::ContentItem::InputImage {
+                    image: codex_protocol::models::ImageReference::Inline {
+                        image_url: local_image_data.into(),
+                    },
+                    detail: Some(ImageDetail::Original),
+                },
+                codex_protocol::models::ContentItem::InputText {
+                    text: codex_protocol::models::image_close_tag_text(),
+                },
+                codex_protocol::models::ContentItem::InputText {
+                    text: codex_protocol::models::local_image_open_tag_text_with_path(
+                        3,
+                        &second_local_image_path,
+                    ),
+                },
+                codex_protocol::models::ContentItem::InputImage {
+                    image: codex_protocol::models::ImageReference::Inline {
+                        image_url: second_local_image_data.into(),
+                    },
+                    detail: Some(ImageDetail::High),
+                },
+                codex_protocol::models::ContentItem::InputText {
+                    text: codex_protocol::models::image_close_tag_text(),
+                },
+            ],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let items = vec![
+            RolloutItem::ResponseItem(local_response_item.into()),
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: "inspect these".into(),
+                images: Some(vec![remote_image_url.into()]),
+                image_details: vec![Some(ImageDetail::High)],
+                local_images: vec![local_image_path.clone(), second_local_image_path.clone()],
+                local_image_details: vec![Some(ImageDetail::Original), Some(ImageDetail::High)],
+                ..Default::default()
+            })),
+            RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: "inspect another image".into(),
+                local_images: vec![unpaired_local_image_path.clone()],
+                ..Default::default()
+            })),
+        ];
+
+        let turns = build_turns_from_rollout_items(&items);
+        let user_messages = turns
+            .iter()
+            .flat_map(|turn| turn.items.iter())
+            .filter_map(|item| match item {
+                ThreadItem::UserMessage { content, .. } => Some(content),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(user_messages.len(), 2);
+        assert_eq!(
+            user_messages[0],
+            &vec![
+                UserInput::Text {
+                    text: "inspect these".into(),
+                    text_elements: Vec::new(),
+                },
+                UserInput::Image {
+                    image: ImageReference::Inline {
+                        url: remote_image_url.into(),
+                    },
+                    detail: Some(ImageDetail::High),
+                },
+                UserInput::Image {
+                    image: ImageReference::Inline {
+                        url: local_image_data.into(),
+                    },
+                    detail: Some(ImageDetail::Original),
+                },
+                UserInput::Image {
+                    image: ImageReference::Inline {
+                        url: second_local_image_data.into(),
+                    },
+                    detail: Some(ImageDetail::High),
+                },
+            ]
+        );
+        assert_eq!(
+            user_messages[1],
+            &vec![
+                UserInput::Text {
+                    text: "inspect another image".into(),
+                    text_elements: Vec::new(),
+                },
+                UserInput::LocalImage {
+                    path: unpaired_local_image_path,
+                    detail: None,
+                },
+            ]
         );
     }
 
